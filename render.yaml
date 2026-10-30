@@ -1,0 +1,30 @@
+# Render Blueprint. El servicio y el disco son de pago.
+# Revisar el presupuesto en Render antes de confirmar la creación.
+services:
+  - type: web
+    name: gympanel
+    runtime: node
+    plan: 0.5c-512mb
+    region: virginia
+    numInstances: 1
+    autoDeployTrigger: "off"
+    buildCommand: npm ci --omit=dev --no-audit --no-fund && npm run check && npm test
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: DATA_DIR
+        value: /var/data/gympanel
+      - key: SEED_DEMO
+        value: "true"
+      - key: OWNER_PASSWORD
+        sync: false
+      - key: PUSH_SUBJECT
+        sync: false
+    disk:
+      name: gympanel-data
+      mountPath: /var/data
+      sizeGB: 1
