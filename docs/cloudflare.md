@@ -68,6 +68,12 @@ Las pruebas automáticas ejecutan el Worker en `workerd`, con D1 local y respues
 - Si el sistema está sin servicio un día completo, no recupera el aviso de ese día. Los límites de CPU y consultas del plan gratuito también pueden interrumpir solicitudes; no cambies a un plan de pago para continuar una prueba.
 - Workers Free incluye 100.000 solicitudes diarias. D1 Free incluye 5 millones de filas leídas y 100.000 escritas al día, y 5 GB totales (con límites adicionales por base). Al alcanzar los límites gratuitos, las operaciones se rechazan hasta el restablecimiento o hasta liberar espacio. Revisá el consumo en tu cuenta.
 
+## Actualizar la primera versión
+
+La migración `0002_management.sql` agrega planes configurables, clases, saldos y auditoría. Reconstruye las tablas relacionadas para retirar la limitación de los tres planes iniciales, conservando IDs, pagos, suscripciones y enlaces privados. Antes de aplicar sobre una base con datos, exportala y conservá sus secretos privados. Las pruebas incluyen una actualización con datos anteriores y verificación de claves foráneas.
+
+La vista ahora distingue vencimiento de saldo pendiente. No se crean deudas por vencimiento y no se alteran importes históricos al editar un plan. Los saldos se registran explícitamente desde la ficha y se cobran por separado de una renovación.
+
 ## Desarrollo local y actualizaciones
 
 ```sh

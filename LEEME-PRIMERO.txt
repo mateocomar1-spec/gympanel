@@ -1,0 +1,45 @@
+GYMPANEL - NUEVA VERSION
+
+EN WINDOWS
+1. Descomprimi el ZIP completo.
+2. Abri la carpeta descomprimida.
+3. Hace doble clic en INICIAR-GYMPANEL.cmd.
+4. Espera el mensaje "Gympanel iniciado" y abri http://localhost:3000.
+5. Deja la ventana abierta mientras usas el panel.
+
+Si Windows solicita confirmar la ejecucion, revisa el archivo y su origen.
+El archivo solo instala las dependencias del proyecto y ejecuta el servidor local.
+
+TAMBIEN PODES USAR VS CODE
+Abri la carpeta que contiene package.json.
+En Terminal > Nueva terminal: npm ci
+Cuando termine: npm start
+Abri http://localhost:3000.
+
+PARA CONSERVAR TU PRUEBA ANTERIOR
+Detene primero la version anterior con Ctrl + C y guarda una copia completa
+de esa carpeta. Si queres conservar sus socios y pagos, copia su carpeta
+"data" completa dentro de esta nueva carpeta, con el servidor apagado.
+No copies solamente el archivo SQLite si el servidor sigue encendido.
+La actualizacion agrega las nuevas tablas y columnas al iniciar.
+Si no copias data, esta carpeta inicia una demostracion nueva.
+
+Si ya preparaste .dev.vars para Cloudflare, conserva ese archivo privado
+y el identificador de tu base en wrangler.jsonc.
+
+QUE CAMBIO
+- Panel blanco y azul y nueva credencial del socio.
+- Membresias editables: nombre, precio, duracion y disponibilidad.
+- Agenda semanal: clase, dia, inicio, fin, profesor, sala y cupo informativo.
+- Ficha del socio con saldo pendiente e historial de ajustes.
+- Cobrar y renovar o cobrar saldo, como operaciones diferentes.
+- Vista previa y envio de un aviso de saldo al celular.
+
+LOS AVISOS EN EL CELULAR
+El socio necesita abrir su credencial desde una direccion publica HTTPS y
+activar las notificaciones. En iPhone debe agregarla a Inicio primero.
+La vista en localhost permite probar el panel, pero no publica la aplicacion.
+La aceptacion del proveedor no garantiza que la persona haya leido el aviso.
+
+Esta version NO incluye reservas, control de asistencia ni pagos online.
+Para publicar gratis en tu cuenta de Cloudflare: docs/cloudflare.md.

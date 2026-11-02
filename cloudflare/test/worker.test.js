@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
-import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createECDH, randomBytes, randomUUID } from 'node:crypto';
@@ -9,8 +9,9 @@ import webpush from 'web-push';
 import ece from 'http_ece';
 import { unstable_splitSqlQuery } from 'wrangler';
 import { today, addDays } from '../worker.js';
+import { managementContract } from '../../test/management-contract.js';
 
-async function fixture(t, { demo = false, password = 'a-private-test-password', pushStatus = () => 201 } = {}) {
+async function fixture(t, { demo = false, password = 'a-private-test-password', pushStatus = () => 201, beforeUpgrade } = {}) {
   const folder = mkdtempSync(join(tmpdir(), 'gympanel-worker-'));
   const keys = webpush.generateVAPIDKeys(), calls = [];
   const options = {
@@ -30,7 +31,10 @@ async function fixture(t, { demo = false, password = 'a-private-test-password', 
   let mf = new Miniflare(runtimeOptions());
   t.after(async () => { await mf.dispose(); rmSync(folder, { recursive: true, force: true }); });
   let db = await mf.getD1Database('DB');
-  await db.batch(unstable_splitSqlQuery(readFileSync('cloudflare/migrations/0001_initial.sql', 'utf8')).map(sql => db.prepare(sql)));
+  for (const migration of readdirSync('cloudflare/migrations').filter(name=>name.endsWith('.sql')).sort()) {
+    await db.batch(unstable_splitSqlQuery(readFileSync('cloudflare/migrations/'+migration,'utf8')).map(sql=>db.prepare(sql)));
+    if (migration === '0001_initial.sql' && beforeUpgrade) await beforeUpgrade(db);
+  }
   async function request(path, method = 'GET', data, { owner = true, headers = {} } = {}) {
     const response = await mf.dispatchFetch('https://gympanel.test' + path, {
       method, headers: { ...(owner ? { Authorization: 'Basic ' + Buffer.from('admin:' + password).toString('base64') } : {}), ...(data ? { 'Content-Type': 'application/json' } : {}), ...headers },
@@ -146,4 +150,28 @@ test('Real scheduled Worker deduplicates reminders, removes expired devices and 
   await scheduled(); assert.equal(calls.length, 3);
   await request('/api/owner/payments', 'POST', { memberId: m.id, amount: 28000, method: 'Efectivo', requestKey: randomUUID() });
   await scheduled(); assert.equal(calls.length, 3);
+});
+
+test('D1 management: custom plans, schedule, recorded balances, debt collections and idempotent push',async t=>{
+  const f=await fixture(t);
+  await managementContract({...f,today,addDays,subscribe:async m=>{
+    const r=await f.request('/api/member/'+m.token+'/subscribe','POST',subscription().data,{owner:false});
+    assert.equal(r.status,201);
+  }});
+});
+
+test('D1 upgrade preserves existing members, payments, devices and private links',async t=>{
+  const token='a'.repeat(48);
+  const f=await fixture(t,{beforeUpgrade:async db=>{
+    await db.prepare('INSERT INTO members(id,name,plan,expires,token,created) VALUES(1,?,?,?,?,?)').bind('Socio anterior','full',today(),token,today()).run();
+    await db.prepare("INSERT INTO payments(member_id,amount,method,date,old_expires,new_expires,request_key) VALUES(1,28000,'Efectivo',?,?,?,?)").bind(today(),today(),addDays(today(),30),randomUUID()).run();
+    const s=subscription();
+    await db.prepare('INSERT INTO subscriptions VALUES(?,?,?,?)').bind(s.data.endpoint,1,JSON.stringify(s.data),today()).run();
+  }});
+  const dashboard=(await f.request('/api/owner/dashboard')).body;
+  assert.equal(dashboard.members[0].token,token);assert.equal(dashboard.members[0].devices,1);
+  assert.equal(dashboard.members[0].balance,0);assert.equal(dashboard.payments[0].amount,28000);
+  assert.equal(dashboard.payments[0].kind,'renewal');
+  assert.equal((await f.request('/api/member/'+token)).body.expires,addDays(today(),30));
+  assert.deepEqual((await f.db.prepare('PRAGMA foreign_key_check').all()).results,[]);
 });

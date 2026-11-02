@@ -1,4 +1,5 @@
 import webpush from 'web-push';
+import { management, managementPath, d1Store } from '../lib/management.js';
 import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 
 const plans = [{ id: 'full', name: 'Pase libre', price: 28000, days: 30 }, { id: 'three', name: '3 veces por semana', price: 22000, days: 30 }, { id: 'morning', name: 'Turno mañana', price: 19000, days: 30 }];
@@ -47,11 +48,11 @@ async function body(request) {
   requireValue(value && typeof value === 'object' && !Array.isArray(value), 'El formulario no es válido.');
   return value;
 }
-function memberInput(data) {
+function memberInput(data, availablePlans, existingPlan) {
   const { name, phone = '', plan, expires } = data;
   requireValue(typeof name === 'string' && name.trim().length >= 2 && name.trim().length <= 100, 'Ingresá un nombre de entre 2 y 100 caracteres.');
   requireValue(typeof phone === 'string' && phone.length <= 30, 'El teléfono no es válido.');
-  requireValue(plans.some(p => p.id === plan), 'Seleccioná un plan válido.');
+  requireValue(availablePlans.some(p => p.id === plan && (p.active || existingPlan === plan)), 'Seleccioná un plan válido.');
   requireValue(typeof expires === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(expires) && Number.isFinite(Date.parse(expires)) && new Date(expires).toISOString().slice(0, 10) === expires, 'Ingresá una fecha de vencimiento válida.');
   return [name.trim(), phone.trim(), plan, expires];
 }
@@ -76,7 +77,7 @@ async function payment(db, data) {
   requireValue(Number.isSafeInteger(Number(memberId)) && Number(memberId) > 0, 'Seleccioná un socio válido.');
   const previous = await db.prepare('SELECT * FROM payments WHERE request_key=?').bind(requestKey).first();
   function replay(row) {
-    requireValue(row.member_id === Number(memberId) && row.amount === amount && row.method === method, 'El identificador de cobro ya fue utilizado.');
+    requireValue(row.member_id === Number(memberId) && row.amount === amount && row.method === method && row.kind === 'renewal', 'El identificador de cobro ya fue utilizado.');
     return json({ expires: row.new_expires, replayed: true });
   }
   if (previous) return replay(previous);
@@ -84,14 +85,14 @@ async function payment(db, data) {
   requireValue(['Transferencia', 'Efectivo', 'Tarjeta'].includes(method), 'Seleccioná un medio de pago válido.');
   const member = await db.prepare('SELECT * FROM members WHERE id=?').bind(Number(memberId)).first();
   requireValue(member, 'Seleccioná un socio válido.');
-  const plan = plans.find(p => p.id === member.plan);
+  const plan = await db.prepare('SELECT * FROM plans WHERE id=?').bind(member.plan).first();
   requireValue(amount === plan.price, `La renovación completa de este plan cuesta $${plan.price}. No se admiten pagos parciales en esta versión.`);
   // INSERT reads the current expiry and the trigger renews it in ONE SQLite statement.
   // Distinct concurrent payments accumulate; the same request key renews only once.
-  const priceCase = "CASE plan WHEN 'full' THEN 28000 WHEN 'three' THEN 22000 WHEN 'morning' THEN 19000 END";
+  
   const inserted = await db.prepare(`INSERT INTO payments(member_id,amount,method,date,old_expires,new_expires,request_key)
-    SELECT id,?,?,?,expires,date(CASE WHEN expires > ? THEN expires ELSE ? END, '+30 days'),?
-    FROM members WHERE id=? AND ?=${priceCase}
+    SELECT m.id,?,?,?,m.expires,date(CASE WHEN m.expires > ? THEN m.expires ELSE ? END, '+' || p.days || ' days'),?
+    FROM members m JOIN plans p ON p.id=m.plan WHERE m.id=? AND ?=p.price
     ON CONFLICT(request_key) DO NOTHING RETURNING *`).bind(amount, method, today(), today(), today(), requestKey, Number(memberId), amount).first();
   if (inserted) return json({ expires: inserted.new_expires }, 201);
   const existing = await db.prepare('SELECT * FROM payments WHERE request_key=?').bind(requestKey).first();
@@ -122,7 +123,7 @@ async function deliver(db, env, member, title, text, kind, send = sendPush) {
       else result.failed++;
     }
   }
-  if (result.sent && (kind === 'test' || !result.failed)) await db.prepare('INSERT OR IGNORE INTO notices(member_id,title,body,created,kind,expiry) VALUES(?,?,?,?,?,?)').bind(member.id, title, text, today(), kind, member.expires).run();
+  if (result.sent && (kind === 'test' || kind.startsWith('manual:') || !result.failed)) await db.prepare('INSERT OR IGNORE INTO notices(member_id,title,body,created,kind,expiry) VALUES(?,?,?,?,?,?)').bind(member.id, title, text, today(), kind, member.expires).run();
   return result;
 }
 export async function reminders(db, env, { send = sendPush } = {}) {
@@ -164,6 +165,12 @@ async function route(request, env) {
     requireValue(!origin || origin === url.origin, 'Origen de la solicitud no permitido.', 403);
     requireValue(request.headers.get('sec-fetch-site') !== 'cross-site', 'Origen de la solicitud no permitido.', 403);
   }
+  if (managementPath(path)) {
+    const result=await management({store:d1Store(db),path,method:request.method,data:['POST','PUT'].includes(request.method)?await body(request):{},date:today(),deliver:(member,title,text,kind)=>deliver(db,env,member,title,text,kind)});
+    return json(result.body,result.status);
+  }
+  const getPlans = async () => (await db.prepare('SELECT * FROM plans ORDER BY active DESC,rowid').all()).results;
+  const getClasses = async () => (await db.prepare('SELECT * FROM classes WHERE active=1 ORDER BY weekday,starts').all()).results;
   if (path === '/api/owner/dashboard' && request.method === 'GET') {
     await seedDemo(db, env);
     const [members, payments, notices] = await db.batch([
@@ -171,16 +178,17 @@ async function route(request, env) {
       db.prepare('SELECT p.*,m.name FROM payments p JOIN members m ON m.id=p.member_id ORDER BY p.id DESC'),
       db.prepare('SELECT n.*,m.name FROM notices n JOIN members m ON m.id=n.member_id ORDER BY n.id DESC LIMIT 100')
     ]);
-    return json({ today: today(), demo: env.SEED_DEMO === 'true', protected: true, reminderSchedule: 'cada hora', plans, members: members.results, payments: payments.results, notices: notices.results });
+    return json({ today: today(), demo: env.SEED_DEMO === 'true', protected: true, reminderSchedule: 'cada hora', plans: await getPlans(), classes: await getClasses(), members: members.results, payments: payments.results, notices: notices.results });
   }
   if (path === '/api/owner/members' && request.method === 'POST') {
-    const values = memberInput(await body(request));
+    const values = memberInput(await body(request), await getPlans());
     const member = await db.prepare('INSERT INTO members(name,phone,plan,expires,token,created) VALUES(?,?,?,?,?,?) RETURNING id').bind(...values, randomBytes(24).toString('hex'), today()).first();
     return json(member, 201);
   }
   const edit = path.match(/^\/api\/owner\/members\/(\d+)$/);
   if (edit && request.method === 'PUT') {
-    const values = memberInput(await body(request));
+    const existing = await db.prepare('SELECT plan FROM members WHERE id=?').bind(Number(edit[1])).first();
+    const values = memberInput(await body(request), await getPlans(), existing?.plan);
     const member = await db.prepare('UPDATE members SET name=?,phone=?,plan=?,expires=? WHERE id=? RETURNING id').bind(...values, Number(edit[1])).first();
     requireValue(member, 'Socio no encontrado.', 404); return json({ ok: true });
   }
@@ -189,13 +197,13 @@ async function route(request, env) {
   const memberRoute = path.match(/^\/api\/member\/([a-f0-9]{48})(?:\/(subscribe|unsubscribe|test))?$/);
   const manifestRoute = path.match(/^\/manifest\/([a-f0-9]{48})\.webmanifest$/);
   if (memberRoute || manifestRoute) {
-    const member = await db.prepare('SELECT id,name,plan,expires,token FROM members WHERE token=?').bind((memberRoute || manifestRoute)[1]).first();
+    const member = await db.prepare('SELECT id,name,plan,expires,token,balance FROM members WHERE token=?').bind((memberRoute || manifestRoute)[1]).first();
     requireValue(member, 'Esta credencial no existe.', 404);
-    if (manifestRoute && request.method === 'GET') return new Response(JSON.stringify({ name: 'Mi membresía · Gympanel', short_name: 'Mi gimnasio', id: `/socio/${member.token}`, start_url: `/socio/${member.token}`, scope: '/', display: 'standalone', background_color: '#f4f6f0', theme_color: '#c1f576', icons: [192, 512].map(size => ({ src: `/icon-${size}.png`, sizes: `${size}x${size}`, type: 'image/png', purpose: 'any' })) }), { headers: { 'Content-Type': 'application/manifest+json' } });
+    if (manifestRoute && request.method === 'GET') return new Response(JSON.stringify({ name: 'Mi membresía · Gympanel', short_name: 'Mi gimnasio', id: `/socio/${member.token}`, start_url: `/socio/${member.token}`, scope: '/', display: 'standalone', background_color: '#f2f6fc', theme_color: '#285ce6', icons: [192, 512].map(size => ({ src: `/icon-${size}.png`, sizes: `${size}x${size}`, type: 'image/png', purpose: 'any' })) }), { headers: { 'Content-Type': 'application/manifest+json' } });
     const action = memberRoute?.[2];
     if (memberRoute && !action && request.method === 'GET') {
-      const [payments, notices] = await db.batch([db.prepare('SELECT amount,method,date,new_expires FROM payments WHERE member_id=? ORDER BY id DESC').bind(member.id), db.prepare('SELECT title,body,created FROM notices WHERE member_id=? ORDER BY id DESC LIMIT 30').bind(member.id)]);
-      return json({ ...member, today: today(), plan: plans.find(p => p.id === member.plan), payments: payments.results, notices: notices.results, publicKey: env.VAPID_PUBLIC_KEY });
+      const [payments, notices] = await db.batch([db.prepare('SELECT amount,method,date,new_expires,kind FROM payments WHERE member_id=? ORDER BY id DESC').bind(member.id), db.prepare('SELECT title,body,created FROM notices WHERE member_id=? ORDER BY id DESC LIMIT 30').bind(member.id)]);
+      return json({ ...member, today: today(), plan: (await getPlans()).find(p => p.id === member.plan), classes: await getClasses(), payments: payments.results, notices: notices.results, publicKey: env.VAPID_PUBLIC_KEY });
     }
     if (action === 'subscribe' && request.method === 'POST') {
       const s = await body(request); validateSubscription(s);
