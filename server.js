@@ -1,4 +1,5 @@
 import express from 'express';
+import { management, managementPath, nodeStore } from './lib/management.js';
 import webpush from 'web-push';
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
@@ -39,6 +40,16 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, 'd
     CREATE TABLE IF NOT EXISTS subscriptions (endpoint TEXT PRIMARY KEY, member_id INTEGER NOT NULL REFERENCES members(id), subscription TEXT NOT NULL, created TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY, member_id INTEGER NOT NULL REFERENCES members(id), title TEXT NOT NULL, body TEXT NOT NULL, created TEXT NOT NULL, kind TEXT NOT NULL, expiry TEXT NOT NULL);
     CREATE UNIQUE INDEX IF NOT EXISTS reminder_once ON notices(member_id, kind, expiry) WHERE kind != 'test';`);
+  if (!db.prepare('PRAGMA table_info(members)').all().some(c => c.name === 'balance')) {
+    db.exec("ALTER TABLE members ADD COLUMN balance INTEGER NOT NULL DEFAULT 0 CHECK(balance>=0); ALTER TABLE members ADD COLUMN balance_note TEXT NOT NULL DEFAULT '';");
+  }
+  const paymentColumns = db.prepare('PRAGMA table_info(payments)').all();
+  if (!paymentColumns.some(c => c.name === 'kind')) db.exec("ALTER TABLE payments ADD COLUMN kind TEXT NOT NULL DEFAULT 'renewal';");
+  if (!paymentColumns.some(c => c.name === 'request_key')) db.exec('ALTER TABLE payments ADD COLUMN request_key TEXT;');
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS payment_key_unique ON payments(request_key);');
+  db.exec(readFileSync(path.join(root,'lib/management-schema.sql'),'utf8'));
+  const getPlans = () => db.prepare('SELECT * FROM plans ORDER BY active DESC,rowid').all();
+  const getClasses = () => db.prepare('SELECT * FROM classes WHERE active=1 ORDER BY weekday,starts').all();
   const keyPath = path.join(dataDir, 'vapid.json');
   if (!existsSync(keyPath)) writeFileSync(keyPath, JSON.stringify(webpush.generateVAPIDKeys()), { mode: 0o600 });
   const keys = JSON.parse(readFileSync(keyPath, 'utf8'));
@@ -67,28 +78,38 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, 'd
   app.get(['/', '/index.html'], owner, (req, res) => res.sendFile(path.join(root, 'public/index.html')));
   app.use('/api/owner', owner);
   app.use('/api', (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
+  app.use('/api/owner', async (req,res,next) => {
+    if (!['GET','HEAD'].includes(req.method)) {
+      const origin=req.get('origin');
+      if (req.get('sec-fetch-site')==='cross-site' || origin && new URL(origin).host!==req.get('host')) return res.status(403).json({error:'Origen de la solicitud no permitido.'});
+    }
+    const route=req.originalUrl.split('?')[0];
+    if (!managementPath(route)) return next();
+    try { const result=await management({store:nodeStore(db),path:route,method:req.method,data:req.body,date:today(),deliver});res.status(result.status).json(result.body); } catch(error) {next(error);}
+  });
   app.get('/healthz', (req, res) => {
     res.set('Cache-Control', 'no-store');
     try { db.prepare('SELECT 1').get(); res.json({ status: 'ok' }); }
     catch { res.status(503).json({ status: 'unavailable' }); }
   });
   const allMembers = () => db.prepare(`SELECT m.*, (SELECT count(*) FROM subscriptions s WHERE s.member_id=m.id) as devices FROM members m ORDER BY m.name COLLATE NOCASE`).all();
-  app.get('/api/owner/dashboard', (req, res) => res.json({ today: today(), demo: seed, protected: Boolean(ownerPassword), plans, members: allMembers(), payments: db.prepare('SELECT p.*, m.name FROM payments p JOIN members m ON m.id=p.member_id ORDER BY p.id DESC').all(), notices: db.prepare('SELECT n.*, m.name FROM notices n JOIN members m ON m.id=n.member_id ORDER BY n.id DESC LIMIT 100').all() }));
+  app.get('/api/owner/dashboard', (req, res) => res.json({ today: today(), demo: seed, protected: Boolean(ownerPassword), plans: getPlans(), classes: getClasses(), members: allMembers(), payments: db.prepare('SELECT p.*, m.name FROM payments p JOIN members m ON m.id=p.member_id ORDER BY p.id DESC').all(), notices: db.prepare('SELECT n.*, m.name FROM notices n JOIN members m ON m.id=n.member_id ORDER BY n.id DESC LIMIT 100').all() }));
   function memberInput(body) {
     const { name, phone = '', plan, expires } = body;
     requireValue(typeof name === 'string' && name.trim().length >= 2 && name.trim().length <= 100, 'Ingresá un nombre de entre 2 y 100 caracteres.');
     requireValue(typeof phone === 'string' && phone.length <= 30, 'El teléfono no es válido.');
-    requireValue(plans.some(p => p.id === plan), 'Seleccioná un plan válido.');
+    requireValue(getPlans().some(p => p.id === plan && (p.active || body.existingPlan === plan)), 'Seleccioná un plan válido.');
     requireValue(validDate(expires), 'Ingresá una fecha de vencimiento válida.');
     return [name.trim(), phone.trim(), plan, expires];
   }
   app.post('/api/owner/members', (req, res) => {
-    const values = memberInput(req.body);
+    const values = memberInput({...req.body, existingPlan: undefined});
     const result = db.prepare('INSERT INTO members (name, phone, plan, expires, token, created) VALUES (?, ?, ?, ?, ?, ?)').run(...values, randomBytes(24).toString('hex'), today());
     res.status(201).json({ id: Number(result.lastInsertRowid) });
   });
   app.put('/api/owner/members/:id', (req, res) => {
-    const values = memberInput(req.body);
+    const existing = db.prepare('SELECT plan FROM members WHERE id=?').get(req.params.id);
+    const values = memberInput({...req.body, existingPlan: existing?.plan});
     const result = db.prepare('UPDATE members SET name=?, phone=?, plan=?, expires=? WHERE id=?').run(...values, req.params.id);
     if (!result.changes) return res.status(404).json({ error: 'Socio no encontrado.' });
     res.json({ ok: true });
@@ -96,21 +117,21 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, 'd
   app.post('/api/owner/payments', (req, res) => {
     const { memberId, amount, method, requestKey } = req.body;
     requireValue(typeof requestKey === 'string' && /^[a-zA-Z0-9-]{16,80}$/.test(requestKey), 'Falta el identificador del cobro. Volvé a abrir el formulario.');
-    const previous = db.prepare('SELECT p.* FROM payment_requests r JOIN payments p ON p.id=r.payment_id WHERE r.request_key=?').get(requestKey);
+    const previous = db.prepare('SELECT * FROM payments WHERE request_key=? OR id=(SELECT payment_id FROM payment_requests WHERE request_key=?)').get(requestKey,requestKey);
     if (previous) {
-      requireValue(previous.member_id === Number(memberId) && previous.amount === amount && previous.method === method, 'El identificador de cobro ya fue utilizado.');
+      requireValue(previous.member_id === Number(memberId) && previous.amount === amount && previous.method === method && previous.kind === 'renewal', 'El identificador de cobro ya fue utilizado.');
       return res.json({ expires: previous.new_expires, replayed: true });
     }
     const member = db.prepare('SELECT * FROM members WHERE id=?').get(Number(memberId));
     requireValue(member, 'Seleccioná un socio válido.');
     requireValue(Number.isSafeInteger(amount) && amount > 0 && amount <= 100000000, 'El importe debe ser un número entero positivo.');
     requireValue(['Transferencia', 'Efectivo', 'Tarjeta'].includes(method), 'Seleccioná un medio de pago válido.');
-    const plan = plans.find(p => p.id === member.plan);
+    const plan = getPlans().find(p => p.id === member.plan);
     requireValue(amount === plan.price, `La renovación completa de este plan cuesta $${plan.price}. No se admiten pagos parciales en esta versión.`);
     const newExpires = addDays(member.expires > today() ? member.expires : today(), plan.days);
     db.exec('BEGIN IMMEDIATE');
     try {
-      const payment = db.prepare('INSERT INTO payments (member_id, amount, method, date, old_expires, new_expires) VALUES (?, ?, ?, ?, ?, ?)').run(member.id, amount, method, today(), member.expires, newExpires);
+      const payment = db.prepare('INSERT INTO payments (member_id, amount, method, date, old_expires, new_expires,request_key) VALUES (?, ?, ?, ?, ?, ?,?)').run(member.id, amount, method, today(), member.expires, newExpires,requestKey);
       db.prepare('INSERT INTO payment_requests VALUES (?, ?)').run(requestKey, payment.lastInsertRowid);
       db.prepare('UPDATE members SET expires=? WHERE id=?').run(newExpires, member.id);
       db.exec('COMMIT');
@@ -118,11 +139,11 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, 'd
     res.status(201).json({ expires: newExpires });
   });
   function findMember(req, res, next) {
-    const member = db.prepare('SELECT id, name, plan, expires, token FROM members WHERE token=?').get(req.params.token);
+    const member = db.prepare('SELECT id, name, plan, expires, token, balance FROM members WHERE token=?').get(req.params.token);
     if (!member) return res.status(404).json({ error: 'Esta credencial no existe.' });
     req.member = member; next();
   }
-  app.get('/api/member/:token', findMember, (req, res) => res.json({ ...req.member, today: today(), plan: plans.find(p => p.id === req.member.plan), payments: db.prepare('SELECT amount, method, date, new_expires FROM payments WHERE member_id=? ORDER BY id DESC').all(req.member.id), notices: db.prepare('SELECT title, body, created FROM notices WHERE member_id=? ORDER BY id DESC LIMIT 30').all(req.member.id), publicKey: keys.publicKey }));
+  app.get('/api/member/:token', findMember, (req, res) => res.json({ ...req.member, today: today(), plan: getPlans().find(p => p.id === req.member.plan), classes: getClasses(), payments: db.prepare('SELECT amount, method, date, new_expires,kind FROM payments WHERE member_id=? ORDER BY id DESC').all(req.member.id), notices: db.prepare('SELECT title, body, created FROM notices WHERE member_id=? ORDER BY id DESC LIMIT 30').all(req.member.id), publicKey: keys.publicKey }));
   app.post('/api/member/:token/subscribe', findMember, (req, res) => {
     const s = req.body;
     requireValue(typeof s.endpoint === 'string' && s.endpoint.length < 2048, 'Suscripción inválida.');
@@ -149,7 +170,7 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, 'd
       catch (e) { if ([404, 410].includes(e.statusCode)) { db.prepare('DELETE FROM subscriptions WHERE endpoint=?').run(sub.endpoint); expired++; } else failed++; }
     }
     // Persist automatic reminder only after delivery to every surviving device.
-    if ((kind === 'test' && sent) || (kind !== 'test' && sent && !failed)) db.prepare('INSERT OR IGNORE INTO notices (member_id,title,body,created,kind,expiry) VALUES (?,?,?,?,?,?)').run(member.id, title, body, today(), kind, member.expires);
+    if (((kind === 'test' || kind.startsWith('manual:')) && sent) || (kind !== 'test' && sent && !failed)) db.prepare('INSERT OR IGNORE INTO notices (member_id,title,body,created,kind,expiry) VALUES (?,?,?,?,?,?)').run(member.id, title, body, today(), kind, member.expires);
     return { sent, failed, expired, devices: subs.length };
   }
   app.post('/api/member/:token/test', findMember, async (req, res) => {
@@ -179,7 +200,7 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, 'd
     res.type('application/manifest+json').set('Cache-Control', 'no-store').json({
       name: 'Mi membresía · Gympanel', short_name: 'Mi gimnasio',
       id: `/socio/${req.member.token}`, start_url: `/socio/${req.member.token}`,
-      scope: '/', display: 'standalone', background_color: '#f4f6f0', theme_color: '#c1f576',
+      scope: '/', display: 'standalone', background_color: '#f2f6fc', theme_color: '#285ce6',
       icons: [192, 512].map(size => ({ src: `/icon-${size}.png`, sizes: `${size}x${size}`, type: 'image/png', purpose: 'any' }))
     });
   });

@@ -1,6 +1,22 @@
 # Gympanel
 
-Primera versión para un gimnasio: socios, membresías, registro manual de cobros y avisos Web Push. Interfaz en español argentino, importes en ARS y calendario de Buenos Aires. Incluye datos ficticios para probar el circuito.
+Panel para un gimnasio: socios, membresías editables, agenda semanal, saldos pendientes, registro manual de cobros y avisos Web Push. Interfaz en español argentino, importes en ARS y calendario de Buenos Aires. Incluye datos ficticios para probar el circuito.
+
+## Prueba online gratuita en Cloudflare
+
+La versión para **Cloudflare Workers Free + D1 Free** conserva la interfaz y guarda socios, cobros y avisos en D1. Los recordatorios se revisan cada hora con Cron, sin mantener un servidor encendido. No requiere Render ni disco de pago. Seguí la [guía de publicación gratuita](docs/cloudflare.md) para configurar la cuenta, la base y los secretos. La publicación necesita tu sesión de Cloudflare; el repositorio por sí solo no crea una URL pública.
+
+`npm run test:cloudflare` verifica el Worker en el entorno local de Cloudflare, incluyendo pagos concurrentes, persistencia D1 y cifrado push. `npm run cloudflare:deploy` publica con los secretos privados de `.dev.vars`. La demo admite tres dispositivos por socio y procesa hasta diez socios por revisión. El servidor Node descrito abajo sigue disponible para uso local o Render.
+
+## Probar la nueva versión en Windows
+
+Descomprimí el ZIP y abrí `INICIAR-GYMPANEL.cmd` con doble clic. Instala los componentes si faltan y ejecuta el servidor desde la carpeta correcta. Cuando indique que está iniciado, abrí `http://localhost:3000`. Conservá la ventana abierta. Leé `LEEME-PRIMERO.txt` para actualizar una copia anterior conservando su carpeta `data`.
+
+## Saldos y avisos manuales
+
+Una membresía vencida no genera deuda automáticamente. Desde Socios → Ver ficha → Ajustar saldo, registrá el saldo total y el motivo. Cada cambio queda en un historial. “Cobrar saldo” admite pagos parciales hasta cubrir lo pendiente y no renueva la membresía. “Cobrar y renovar” aplica el plan actual y no modifica saldos previos. Los dos cobros son idempotentes ante reintentos.
+
+“Enviar aviso” presenta el socio, el monto actual y un mensaje antes de confirmar. Requiere un saldo positivo y dispositivos con push activado. Se valida que el monto no haya cambiado; repetir la misma solicitud no reenvía el mensaje y hay un intervalo de un minuto entre avisos al mismo socio. Los importes pueden verse en la pantalla bloqueada. El historial registra la aceptación del proveedor, no lectura. Esta entrega no envía avisos reales sin una confirmación desde el panel.
 
 ## Desarrollo
 
@@ -18,12 +34,12 @@ El panel permite:
 
 - Crear y editar socios, asignar un plan y su vencimiento; buscar y filtrar por estado.
 - Registrar una cuota completa mediante transferencia, efectivo o tarjeta. Es un registro manual: no procesa dinero ni verifica transferencias.
-- Renovar 30 días desde el vencimiento si sigue vigente, o desde hoy si venció. Cada confirmación tiene una clave de idempotencia para evitar duplicados al reintentar.
+- Renovar por la duración configurada en el plan desde el vencimiento si sigue vigente, o desde hoy si venció. Cada confirmación tiene una clave de idempotencia para evitar duplicados al reintentar.
 - Consultar ingresos del mes, evolución de seis meses e historial de pagos.
 - Compartir una credencial privada del socio, con sus pagos y vencimiento.
 - Activar/desactivar push por dispositivo y solicitar un aviso de prueba desde la credencial.
 
-Los tres planes y sus precios son iniciales, definidos en `server.js`; esta versión todavía no incluye un editor de planes. “Base Training” es el nombre ficticio usado en la demostración.
+Los tres planes iniciales se pueden editar, archivar o complementar desde Membresías. Los cambios de precio y duración se aplican a próximas renovaciones y no modifican los pagos históricos ni los saldos registrados. La agenda semanal se edita desde Clases y horarios y se comparte en las credenciales; sus cupos son informativos, sin reservas ni asistencia.
 
 ## Configuración
 

@@ -1,0 +1,46 @@
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+
+export async function managementContract({request,member,today,addDays,subscribe,calls}) {
+  const plan={name:'Plan flexible',price:35000,days:45,description:'Acceso a clases',active:1};
+  const created=await request('/api/owner/plans','POST',plan);assert.equal(created.status,201,JSON.stringify(created.body));
+  const m=await member({plan:created.body.id,expires:today()});
+  let paid=await request('/api/owner/payments','POST',{memberId:m.id,amount:35000,method:'Efectivo',requestKey:randomUUID()});
+  assert.equal(paid.status,201,JSON.stringify(paid.body));assert.equal(paid.body.expires,addDays(today(),45));
+  assert.equal((await request('/api/owner/plans/'+created.body.id,'PUT',{...plan,price:40000,days:60})).status,200);
+  assert.equal((await request('/api/owner/payments','POST',{memberId:m.id,amount:35000,method:'Efectivo',requestKey:randomUUID()})).status,400);
+  paid=await request('/api/owner/payments','POST',{memberId:m.id,amount:40000,method:'Efectivo',requestKey:randomUUID()});
+  assert.equal(paid.body.expires,addDays(today(),105));
+  assert.equal((await request('/api/owner/plans/'+created.body.id,'PUT',{...plan,price:40000,days:60,active:0})).status,200);
+  assert.equal((await request('/api/owner/members','POST',{name:'Asignación inválida',plan:created.body.id,expires:today()})).status,400);
+  assert.equal((await request('/api/owner/members/'+m.id,'PUT',{name:'Socio editado',phone:'',plan:created.body.id,expires:paid.body.expires})).status,200);
+  const session={name:'Funcional',weekday:1,starts:'09:00',ends:'10:00',coach:'Ana',room:'Sala A',capacity:20};
+  const first=await request('/api/owner/classes','POST',session);assert.equal(first.status,201,JSON.stringify(first.body));
+  assert.equal((await request('/api/owner/classes','POST',{...session,starts:'10:00',ends:'09:00'})).status,400);
+  assert.equal((await request('/api/owner/classes','POST',{...session,starts:'09:30'})).status,409);
+  const other=await request('/api/owner/classes','POST',{...session,room:'Sala B'});assert.equal(other.status,201);
+  assert.equal((await request('/api/owner/classes/'+first.body.id,'PUT',{...session,starts:'08:00',ends:'09:00'})).status,200);
+  let personal=(await request('/api/member/'+m.token)).body;
+  assert.equal(personal.classes.length,2);assert.equal(personal.classes[0].starts,'08:00');
+  const key=randomUUID();
+  assert.equal((await request(`/api/owner/members/${m.id}/debt-notice`,'POST',{amount:0,requestKey:key})).status,400);
+  let adjusted=await request(`/api/owner/members/${m.id}/balance`,'PUT',{balance:15000,expectedBalance:0,reason:'Cuota pendiente registrada'});assert.equal(adjusted.status,200,JSON.stringify(adjusted.body));
+  assert.equal((await request(`/api/owner/members/${m.id}/balance`,'PUT',{balance:9999,expectedBalance:0,reason:'Otro ajuste'})).status,409);
+  assert.equal((await request(`/api/owner/members/${m.id}/debt-notice`,'POST',{amount:15000,requestKey:key})).status,409);
+  await subscribe(m);
+  const preview=await request(`/api/owner/members/${m.id}/debt-notice`);assert.equal(preview.body.amount,15000);assert.match(preview.body.body,/15\.000/);
+  assert.equal((await request(`/api/owner/members/${m.id}/debt-notice`,'POST',{amount:14000,requestKey:key})).status,409);
+  const before=calls.length;
+  const sent=await request(`/api/owner/members/${m.id}/debt-notice`,'POST',{amount:15000,requestKey:key});assert.equal(sent.status,200,JSON.stringify(sent.body));assert.equal(sent.body.sent,1);
+  const replay=await request(`/api/owner/members/${m.id}/debt-notice`,'POST',{amount:15000,requestKey:key});assert.equal(replay.status,200);assert.equal(replay.body.replayed,true);assert.equal(calls.length,before+1);
+  assert.equal((await request(`/api/owner/members/${m.id}/debt-notice`,'POST',{amount:15000,requestKey:randomUUID()})).status,429);
+  const debtPayment={amount:5000,method:'Transferencia',requestKey:randomUUID()};
+  const results=await Promise.all(Array.from({length:3},()=>request(`/api/owner/members/${m.id}/debt-payment`,'POST',debtPayment)));
+  assert.equal(results.filter(r=>r.status===201).length,1,JSON.stringify(results));assert.equal(results.filter(r=>r.status===200).length,2);
+  personal=(await request('/api/member/'+m.token)).body;assert.equal(personal.balance,10000);assert.equal(personal.expires,addDays(today(),105));
+  assert.equal((await request(`/api/owner/members/${m.id}/debt-payment`,'POST',{...debtPayment,amount:20000,requestKey:randomUUID()})).status,400);
+  const ledger=(await request(`/api/owner/members/${m.id}/balance`)).body;assert.equal(ledger.changes.length,2);assert.equal(ledger.changes[0].new_balance,10000);
+  const dashboard=(await request('/api/owner/dashboard')).body;assert.equal(dashboard.payments.filter(p=>p.kind==='debt').length,1);assert.equal(dashboard.payments.find(p=>p.amount===35000).amount,35000);
+  assert.equal((await request('/api/owner/classes/'+other.body.id,'DELETE')).status,200);
+  assert.equal((await request('/api/member/'+m.token)).body.classes.length,1);
+}
