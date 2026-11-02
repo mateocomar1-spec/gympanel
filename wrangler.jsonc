@@ -15,7 +15,7 @@
   "d1_databases": [{
     "binding": "DB",
     "database_name": "gympanel",
-    "database_id": "00000000-0000-0000-0000-000000000000",
+    "database_id": "bc19db04-ec7c-49da-b841-dc21f22fb41b",
     "migrations_dir": "cloudflare/migrations"
   }],
   "triggers": { "crons": ["0 * * * *"] },
