@@ -2,6 +2,12 @@
 
 Primera versión para un gimnasio: socios, membresías, registro manual de cobros y avisos Web Push. Interfaz en español argentino, importes en ARS y calendario de Buenos Aires. Incluye datos ficticios para probar el circuito.
 
+## Prueba online gratuita en Cloudflare
+
+La versión para **Cloudflare Workers Free + D1 Free** conserva la interfaz y guarda socios, cobros y avisos en D1. Los recordatorios se revisan cada hora con Cron, sin mantener un servidor encendido. No requiere Render ni disco de pago. Seguí la [guía de publicación gratuita](docs/cloudflare.md) para configurar la cuenta, la base y los secretos. La publicación necesita tu sesión de Cloudflare; el repositorio por sí solo no crea una URL pública.
+
+`npm run test:cloudflare` verifica el Worker en el entorno local de Cloudflare, incluyendo pagos concurrentes, persistencia D1 y cifrado push. `npm run cloudflare:deploy` publica con los secretos privados de `.dev.vars`. La demo admite tres dispositivos por socio y procesa hasta diez socios por revisión. El servidor Node descrito abajo sigue disponible para uso local o Render.
+
 ## Desarrollo
 
 Requiere **Node.js 24.x** (versión verificada: 24.19.0). Usa Express, SQLite integrado en Node y `web-push`. No requiere Docker ni una base externa.

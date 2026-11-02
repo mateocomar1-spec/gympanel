@@ -2,3 +2,7 @@ node_modules/
 data/
 .env
 coverage/
+.dev.vars
+.dev.vars.*
+.wrangler/
+work/
